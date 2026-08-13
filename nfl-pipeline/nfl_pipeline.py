@@ -329,7 +329,11 @@ class NFLPipeline:
             logger.info(f"  {table_name}: no rows to write, skipping.")
             return
 
-        df = df.replace({np.nan: None})
+        df = df.replace({np.nan: None}
+
+
+
+
 
         with self.engine.begin() as conn:
             key_tuples = df[key_cols].drop_duplicates().reset_index(drop=True)
@@ -343,7 +347,10 @@ class NFLPipeline:
                     placeholders = ", ".join(f":k{i}_{j}" for j in range(len(key_cols)))
                     row_placeholders.append(f"({placeholders})")
                     for j, k in enumerate(key_cols):
-                        params[f"k{i}_{j}"] = row[k]
+                        value = row[k]
+                        if hasattr(value, 'item'):
+                            value = value.item()
+                        params[f"k{i}_{j}"] = value
                 values_clause = ", ".join(row_placeholders)
                 conn.execute(
                     text(f'DELETE FROM {table_name} WHERE ({key_cols_sql}) IN ({values_clause})'),
