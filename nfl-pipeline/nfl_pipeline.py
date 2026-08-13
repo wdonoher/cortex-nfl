@@ -37,10 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('nfl_pipeline')
 
-# nflfastR's full pbp schema has 370+ columns per play. EPAFeatureEngine
-# and UnitRatingEngine only actually use these — pulling everything else
-# was a major, unnecessary memory cost, and a likely contributor to the
-# OOM crash observed during the first full 5-year backfill attempt.
 PBP_COLUMNS = [
     'game_id', 'season', 'week', 'posteam', 'defteam',
     'epa', 'pass_attempt', 'rush_attempt', 'sack', 'qb_hit',
@@ -112,8 +108,7 @@ class NFLPipeline:
         logger.info(f"  schedule: {len(schedule)} rows")
 
         pbp = nfl.import_pbp_data(seasons, columns=PBP_COLUMNS, downcast=True)
-        logger.info(f"  play-by-play: {len(pbp)} rows, {len(pbp.columns)} columns "
-                     f"(narrowed from nflfastR's full ~370-column schema)")
+        logger.info(f"  play-by-play: {len(pbp)} rows, {len(pbp.columns)} columns")
 
         try:
             injuries = nfl.import_injuries(seasons)
@@ -188,11 +183,6 @@ class NFLPipeline:
         return weekly_stats_df[available]
 
     def prepare_draft_picks(self, draft_picks_df):
-        """
-        Note the real nflverse schema uses 'pfr_player_name' and 'gsis_id'
-        (not the generic 'player_name'/'player_id' originally assumed) —
-        renamed here to match the rest of the pipeline's naming convention.
-        """
         if draft_picks_df.empty:
             return draft_picks_df
 
@@ -319,21 +309,11 @@ class NFLPipeline:
         logger.info("Tables verified/created.")
 
     def upsert_by_keys(self, df, table_name, key_cols, batch_size=1000):
-        """
-        Idempotent write: deletes any existing rows matching the key
-        combinations present in df, then inserts. Deletes are batched
-        (default 1000 keys per query) using a single multi-row DELETE
-        per batch, rather than one query per row.
-        """
         if df.empty:
             logger.info(f"  {table_name}: no rows to write, skipping.")
             return
 
-        df = df.replace({np.nan: None}
-
-
-
-
+        df = df.replace({np.nan: None})
 
         with self.engine.begin() as conn:
             key_tuples = df[key_cols].drop_duplicates().reset_index(drop=True)
