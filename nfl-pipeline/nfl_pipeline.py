@@ -37,6 +37,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger('nfl_pipeline')
 
+# nflfastR's full pbp schema has 370+ columns per play. EPAFeatureEngine
+# and UnitRatingEngine only actually use these — pulling everything else
+# was a major, unnecessary memory cost, and a likely contributor to the
+# OOM crash observed during the first full 5-year backfill attempt.
+PBP_COLUMNS = [
+    'game_id', 'season', 'week', 'posteam', 'defteam',
+    'epa', 'pass_attempt', 'rush_attempt', 'sack', 'qb_hit',
+]
+
 
 def determine_current_season(today=None):
     today = today or datetime.utcnow()
@@ -102,8 +111,9 @@ class NFLPipeline:
         schedule = nfl.import_schedules(seasons)
         logger.info(f"  schedule: {len(schedule)} rows")
 
-        pbp = nfl.import_pbp_data(seasons, downcast=True)
-        logger.info(f"  play-by-play: {len(pbp)} rows")
+        pbp = nfl.import_pbp_data(seasons, columns=PBP_COLUMNS, downcast=True)
+        logger.info(f"  play-by-play: {len(pbp)} rows, {len(pbp.columns)} columns "
+                     f"(narrowed from nflfastR's full ~370-column schema)")
 
         try:
             injuries = nfl.import_injuries(seasons)
@@ -178,17 +188,26 @@ class NFLPipeline:
         return weekly_stats_df[available]
 
     def prepare_draft_picks(self, draft_picks_df):
+        """
+        Note the real nflverse schema uses 'pfr_player_name' and 'gsis_id'
+        (not the generic 'player_name'/'player_id' originally assumed) —
+        renamed here to match the rest of the pipeline's naming convention.
+        """
         if draft_picks_df.empty:
             return draft_picks_df
 
-        wanted = ['season', 'round', 'pick', 'player_id', 'player_name',
-                  'position', 'team']
+        wanted = ['season', 'round', 'pick', 'team', 'gsis_id',
+                  'pfr_player_name', 'position']
         available = [c for c in wanted if c in draft_picks_df.columns]
         missing = set(wanted) - set(available)
         if missing:
             logger.warning(f"  draft picks missing expected columns: {missing}")
 
-        return draft_picks_df[available]
+        result = draft_picks_df[available].rename(columns={
+            'gsis_id': 'player_id',
+            'pfr_player_name': 'player_name',
+        })
+        return result
 
     def run_feature_engineering(self, games_df, pbp_df, schedule_unrolled_df):
         logger.info("Running Elo engine...")
@@ -299,7 +318,13 @@ class NFLPipeline:
                     conn.execute(text(statement))
         logger.info("Tables verified/created.")
 
-    def upsert_by_keys(self, df, table_name, key_cols):
+    def upsert_by_keys(self, df, table_name, key_cols, batch_size=1000):
+        """
+        Idempotent write: deletes any existing rows matching the key
+        combinations present in df, then inserts. Deletes are batched
+        (default 1000 keys per query) using a single multi-row DELETE
+        per batch, rather than one query per row.
+        """
         if df.empty:
             logger.info(f"  {table_name}: no rows to write, skipping.")
             return
@@ -307,13 +332,21 @@ class NFLPipeline:
         df = df.replace({np.nan: None})
 
         with self.engine.begin() as conn:
-            key_tuples = df[key_cols].drop_duplicates()
+            key_tuples = df[key_cols].drop_duplicates().reset_index(drop=True)
+            key_cols_sql = ", ".join(f'"{k}"' for k in key_cols)
 
-            for _, row in key_tuples.iterrows():
-                conditions = " AND ".join([f'"{k}" = :{k}' for k in key_cols])
-                params = {k: row[k] for k in key_cols}
+            for start in range(0, len(key_tuples), batch_size):
+                batch = key_tuples.iloc[start:start + batch_size]
+                row_placeholders = []
+                params = {}
+                for i, row in batch.iterrows():
+                    placeholders = ", ".join(f":k{i}_{j}" for j in range(len(key_cols)))
+                    row_placeholders.append(f"({placeholders})")
+                    for j, k in enumerate(key_cols):
+                        params[f"k{i}_{j}"] = row[k]
+                values_clause = ", ".join(row_placeholders)
                 conn.execute(
-                    text(f'DELETE FROM {table_name} WHERE {conditions}'),
+                    text(f'DELETE FROM {table_name} WHERE ({key_cols_sql}) IN ({values_clause})'),
                     params
                 )
 
