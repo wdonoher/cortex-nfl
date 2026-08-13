@@ -3,33 +3,6 @@ Cortex Sports Analytics — NFL Automated Pipeline
 =================================================
 The unattended job that runs on Railway's scheduler. Fetches everything
 via API, computes Elo/EPA/Unit Ratings, writes to Postgres, syncs to S3.
-No manual data handling anywhere in this file — if a step ever requires
-someone to fetch or upload something by hand, that step is a bug.
-
-FILE ORGANIZATION (assumed repo layout):
-    nfl_feature_engineering.py   <- NFLEloEngine, EPAFeatureEngine, UnitRatingEngine
-    nfl_pipeline.py               <- this file, imports the above
-
-ENVIRONMENT VARIABLES (set in Railway's project settings, not in code):
-    DATABASE_URL           - Postgres connection string (Railway sets this
-                              automatically for linked Postgres services)
-    S3_BUCKET               - optional, for raw/feature snapshot exports
-    AWS_ACCESS_KEY_ID       - optional, required only if S3_BUCKET is set
-    AWS_SECRET_ACCESS_KEY   - optional, required only if S3_BUCKET is set
-    AWS_REGION               - optional, defaults to 'us-east-1'
-
-RAILWAY CRON SETUP:
-    Weekly job (Thursday 10:00 AM ET, matching the agreed pipeline cadence):
-        schedule: "0 14 * * 4"   (14:00 UTC ≈ 10:00 AM ET)
-        command:  python nfl_pipeline.py --mode weekly
-
-    Historical backfill (run ONCE via Railway's one-off "Run Command",
-    not on the recurring cron schedule):
-        command:  python nfl_pipeline.py --mode backfill --start-year 2018 --end-year 2025
-
-Both modes are fully scripted — the backfill is a one-off *job invocation*,
-not a manual data-handling step. Nothing is downloaded to a computer,
-copied, or uploaded by a person at any point.
 """
 
 import os
@@ -52,6 +25,12 @@ try:
 except ImportError:
     S3_AVAILABLE = False
 
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
@@ -59,23 +38,40 @@ logging.basicConfig(
 logger = logging.getLogger('nfl_pipeline')
 
 
-# ============================================================================
-# SEASON HELPERS
-# ============================================================================
-
 def determine_current_season(today=None):
-    """
-    NFL seasons are labeled by the year they start (e.g. games from
-    Sept 2026 through Feb 2027 are all 'season 2026'). Jan/Feb games
-    belong to the *previous* label.
-    """
     today = today or datetime.utcnow()
     return today.year if today.month >= 3 else today.year - 1
 
 
-# ============================================================================
-# PIPELINE
-# ============================================================================
+def send_failure_alert(run_label, error, seasons=None):
+    webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+    if not webhook_url:
+        logger.warning(
+            "SLACK_WEBHOOK_URL not set — failure alert not sent. "
+            "This run's failure will only be visible in Railway logs."
+        )
+        return
+    if not REQUESTS_AVAILABLE:
+        logger.warning("requests library not installed — cannot send Slack alert.")
+        return
+
+    season_note = f" (seasons: {seasons})" if seasons else ""
+    payload = {
+        "text": (
+            f":rotating_light: *Cortex NFL Pipeline Failure*\n"
+            f"Run: `{run_label}`{season_note}\n"
+            f"Error: `{str(error)}`\n"
+            f"Time (UTC): {datetime.utcnow().isoformat()}"
+        )
+    }
+
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        logger.info("Failure alert sent to Slack.")
+    except Exception as alert_err:
+        logger.error(f"Failed to send Slack alert: {alert_err}")
+
 
 class NFLPipeline:
 
@@ -100,10 +96,6 @@ class NFLPipeline:
                     's3', region_name=os.environ.get('AWS_REGION', 'us-east-1')
                 )
 
-    # ------------------------------------------------------------------
-    # SOURCE DATA (all pulled via API — nfl_data_py -> nflverse GitHub)
-    # ------------------------------------------------------------------
-
     def fetch_source_data(self, seasons):
         logger.info(f"Fetching source data for seasons: {seasons}")
 
@@ -127,29 +119,36 @@ class NFLPipeline:
             logger.warning(f"  rosters fetch failed, continuing without: {e}")
             rosters = pd.DataFrame()
 
+        try:
+            weekly_stats = nfl.import_weekly_data(seasons)
+            logger.info(f"  weekly player stats: {len(weekly_stats)} rows")
+        except Exception as e:
+            logger.warning(f"  weekly player stats fetch failed, continuing without: {e}")
+            weekly_stats = pd.DataFrame()
+
+        try:
+            draft_picks = nfl.import_draft_picks(seasons)
+            logger.info(f"  draft picks: {len(draft_picks)} rows")
+        except Exception as e:
+            logger.warning(f"  draft picks fetch failed, continuing without: {e}")
+            draft_picks = pd.DataFrame()
+
         return {
             'schedule': schedule,
             'pbp': pbp,
             'injuries': injuries,
             'rosters': rosters,
+            'weekly_stats': weekly_stats,
+            'draft_picks': draft_picks,
         }
 
-    # ------------------------------------------------------------------
-    # SHAPE DATA FOR THE FEATURE ENGINES
-    # ------------------------------------------------------------------
-
     def build_games_df(self, schedule_df):
-        """Completed games only, in the schema NFLEloEngine expects."""
         games = schedule_df[schedule_df['home_score'].notna()].copy()
         games = games.rename(columns={'game_id': 'game_id'})
         return games[['game_id', 'season', 'week', 'home_team', 'away_team',
                        'home_score', 'away_score']]
 
     def build_schedule_unrolled(self, schedule_df):
-        """
-        One row per team per game (not per game), with an 'opponent'
-        column — the shape UnitRatingEngine's opponent-adjustment needs.
-        """
         played = schedule_df[schedule_df['home_score'].notna()].copy()
 
         home_rows = played[['season', 'week', 'home_team', 'away_team']].rename(
@@ -161,9 +160,35 @@ class NFLPipeline:
 
         return pd.concat([home_rows, away_rows], ignore_index=True)
 
-    # ------------------------------------------------------------------
-    # FEATURE ENGINEERING
-    # ------------------------------------------------------------------
+    def prepare_weekly_stats(self, weekly_stats_df):
+        if weekly_stats_df.empty:
+            return weekly_stats_df
+
+        wanted = ['player_id', 'player_name', 'position', 'recent_team',
+                  'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
+                  'rushing_tds', 'targets', 'receptions', 'receiving_yards',
+                  'receiving_tds', 'air_yards', 'passing_yards', 'passing_tds',
+                  'interceptions', 'sacks', 'fantasy_points', 'fantasy_points_ppr']
+
+        available = [c for c in wanted if c in weekly_stats_df.columns]
+        missing = set(wanted) - set(available)
+        if missing:
+            logger.warning(f"  weekly stats missing expected columns: {missing}")
+
+        return weekly_stats_df[available]
+
+    def prepare_draft_picks(self, draft_picks_df):
+        if draft_picks_df.empty:
+            return draft_picks_df
+
+        wanted = ['season', 'round', 'pick', 'player_id', 'player_name',
+                  'position', 'team']
+        available = [c for c in wanted if c in draft_picks_df.columns]
+        missing = set(wanted) - set(available)
+        if missing:
+            logger.warning(f"  draft picks missing expected columns: {missing}")
+
+        return draft_picks_df[available]
 
     def run_feature_engineering(self, games_df, pbp_df, schedule_unrolled_df):
         logger.info("Running Elo engine...")
@@ -180,13 +205,7 @@ class NFLPipeline:
 
         return elo_history, epa_features, unit_ratings
 
-    # ------------------------------------------------------------------
-    # DATABASE
-    # ------------------------------------------------------------------
-
     def ensure_tables(self):
-        """Creates feature tables if they don't already exist. Safe to
-        run every time — CREATE TABLE IF NOT EXISTS is idempotent."""
         ddl = """
         CREATE TABLE IF NOT EXISTS nfl_elo_ratings (
             game_id TEXT PRIMARY KEY,
@@ -235,6 +254,44 @@ class NFLPipeline:
             updated_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (team, season, week)
         );
+
+        CREATE TABLE IF NOT EXISTS nfl_player_weekly_stats (
+            player_id TEXT,
+            player_name TEXT,
+            position TEXT,
+            recent_team TEXT,
+            opponent_team TEXT,
+            season INTEGER,
+            week INTEGER,
+            carries DOUBLE PRECISION,
+            rushing_yards DOUBLE PRECISION,
+            rushing_tds DOUBLE PRECISION,
+            targets DOUBLE PRECISION,
+            receptions DOUBLE PRECISION,
+            receiving_yards DOUBLE PRECISION,
+            receiving_tds DOUBLE PRECISION,
+            air_yards DOUBLE PRECISION,
+            passing_yards DOUBLE PRECISION,
+            passing_tds DOUBLE PRECISION,
+            interceptions DOUBLE PRECISION,
+            sacks DOUBLE PRECISION,
+            fantasy_points DOUBLE PRECISION,
+            fantasy_points_ppr DOUBLE PRECISION,
+            updated_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (player_id, season, week)
+        );
+
+        CREATE TABLE IF NOT EXISTS nfl_draft_picks (
+            season INTEGER,
+            round INTEGER,
+            pick INTEGER,
+            player_id TEXT,
+            player_name TEXT,
+            position TEXT,
+            team TEXT,
+            updated_at TIMESTAMP DEFAULT NOW(),
+            PRIMARY KEY (season, pick)
+        );
         """
         with self.engine.begin() as conn:
             for statement in ddl.strip().split(';'):
@@ -243,12 +300,6 @@ class NFLPipeline:
         logger.info("Tables verified/created.")
 
     def upsert_by_keys(self, df, table_name, key_cols):
-        """
-        Idempotent write: deletes any existing rows matching the key
-        combinations present in df, then inserts. Safe to re-run the
-        same week (or a full backfill) repeatedly without duplicating
-        or erroring on conflict.
-        """
         if df.empty:
             logger.info(f"  {table_name}: no rows to write, skipping.")
             return
@@ -270,10 +321,6 @@ class NFLPipeline:
 
         logger.info(f"  {table_name}: wrote {len(df)} rows.")
 
-    # ------------------------------------------------------------------
-    # S3 SYNC (optional snapshot export)
-    # ------------------------------------------------------------------
-
     def sync_to_s3(self, df, key):
         if not self.s3_client:
             return
@@ -282,10 +329,6 @@ class NFLPipeline:
         buffer.seek(0)
         self.s3_client.put_object(Bucket=self.s3_bucket, Key=key, Body=buffer.getvalue())
         logger.info(f"  synced to s3://{self.s3_bucket}/{key}")
-
-    # ------------------------------------------------------------------
-    # ENTRY POINTS
-    # ------------------------------------------------------------------
 
     def run(self, seasons, run_label):
         source = self.fetch_source_data(seasons)
@@ -297,12 +340,18 @@ class NFLPipeline:
             games_df, source['pbp'], schedule_unrolled
         )
 
+        weekly_stats = self.prepare_weekly_stats(source['weekly_stats'])
+        draft_picks = self.prepare_draft_picks(source['draft_picks'])
+
         self.ensure_tables()
 
         logger.info("Writing to Postgres...")
         self.upsert_by_keys(elo_history, 'nfl_elo_ratings', ['game_id'])
         self.upsert_by_keys(epa_features, 'nfl_epa_features', ['team', 'season', 'week'])
         self.upsert_by_keys(unit_ratings, 'nfl_unit_ratings', ['team', 'season', 'week'])
+        self.upsert_by_keys(weekly_stats, 'nfl_player_weekly_stats',
+                             ['player_id', 'season', 'week'])
+        self.upsert_by_keys(draft_picks, 'nfl_draft_picks', ['season', 'pick'])
 
         if self.s3_client:
             logger.info("Syncing snapshots to S3...")
@@ -320,28 +369,42 @@ class NFLPipeline:
 
     def run_backfill(self, start_year, end_year):
         seasons = list(range(start_year, end_year + 1))
+        if len(seasons) > 2:
+            logger.info(
+                f"Backfill spans {len(seasons)} seasons ({seasons[0]}-{seasons[-1]}). "
+                "Consider testing a smaller range first."
+            )
         logger.info(f"=== BACKFILL RUN — seasons {seasons} ===")
         self.run(seasons=seasons, run_label='backfill')
 
 
-# ============================================================================
-# CLI
-# ============================================================================
-
 def main():
     parser = argparse.ArgumentParser(description="Cortex Sports Analytics — NFL Pipeline")
     parser.add_argument('--mode', choices=['weekly', 'backfill'], required=True)
-    parser.add_argument('--start-year', type=int, default=2018)
+    parser.add_argument('--start-year', type=int, default=None)
     parser.add_argument('--end-year', type=int, default=None)
     args = parser.parse_args()
 
-    pipeline = NFLPipeline()
+    current_season = determine_current_season()
+    run_label = args.mode
+    seasons_ctx = None
 
-    if args.mode == 'weekly':
-        pipeline.run_weekly()
-    else:
-        end_year = args.end_year or determine_current_season()
-        pipeline.run_backfill(args.start_year, end_year)
+    try:
+        pipeline = NFLPipeline()
+
+        if args.mode == 'weekly':
+            seasons_ctx = [current_season]
+            pipeline.run_weekly()
+        else:
+            end_year = args.end_year if args.end_year is not None else current_season - 1
+            start_year = args.start_year if args.start_year is not None else current_season - 5
+            seasons_ctx = list(range(start_year, end_year + 1))
+            pipeline.run_backfill(start_year, end_year)
+
+    except Exception as e:
+        logger.exception(f"Pipeline run failed ({run_label}).")
+        send_failure_alert(run_label, e, seasons_ctx)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
