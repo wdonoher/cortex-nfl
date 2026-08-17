@@ -180,21 +180,30 @@ class NFLPipeline:
         return pd.concat([home_rows, away_rows], ignore_index=True)
 
     def prepare_weekly_stats(self, weekly_stats_df):
+        """
+        Note: the source column is 'receiving_air_yards', not 'air_yards'
+        (that generic name only exists in raw play-by-play data) — renamed
+        here to match the table schema and downstream feature naming.
+        """
         if weekly_stats_df.empty:
             return weekly_stats_df
 
         wanted = ['player_id', 'player_name', 'position', 'recent_team',
                   'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
                   'rushing_tds', 'targets', 'receptions', 'receiving_yards',
-                  'receiving_tds', 'air_yards', 'passing_yards', 'passing_tds',
-                  'interceptions', 'sacks', 'fantasy_points', 'fantasy_points_ppr']
+                  'receiving_tds', 'receiving_air_yards', 'passing_yards',
+                  'passing_tds', 'interceptions', 'sacks', 'fantasy_points',
+                  'fantasy_points_ppr']
 
         available = [c for c in wanted if c in weekly_stats_df.columns]
         missing = set(wanted) - set(available)
         if missing:
             logger.warning(f"  weekly stats missing expected columns: {missing}")
 
-        return weekly_stats_df[available]
+        result = weekly_stats_df[available].rename(
+            columns={'receiving_air_yards': 'air_yards'}
+        )
+        return result
 
     def prepare_draft_picks(self, draft_picks_df):
         if draft_picks_df.empty:
