@@ -125,7 +125,7 @@ class NFLPipeline:
             rosters = pd.DataFrame()
 
         try:
-            weekly_stats = nfl.import_weekly_data(seasons)
+            weekly_stats = self._fetch_weekly_stats_per_season(seasons)
             logger.info(f"  weekly player stats: {len(weekly_stats)} rows")
         except Exception as e:
             logger.warning(f"  weekly player stats fetch failed, continuing without: {e}")
@@ -146,6 +146,20 @@ class NFLPipeline:
             'weekly_stats': weekly_stats,
             'draft_picks': draft_picks,
         }
+
+    def _fetch_weekly_stats_per_season(self, seasons):
+        frames = []
+        for season in seasons:
+            try:
+                season_df = nfl.import_weekly_data([season])
+                frames.append(season_df)
+            except Exception as e:
+                logger.warning(f"    weekly stats for {season} failed, skipping: {e}")
+
+        if not frames:
+            return pd.DataFrame()
+
+        return pd.concat(frames, ignore_index=True)
 
     def build_games_df(self, schedule_df):
         games = schedule_df[schedule_df['home_score'].notna()].copy()
