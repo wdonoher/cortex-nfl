@@ -53,6 +53,17 @@ def determine_current_season(today=None):
     return today.year if today.month >= 3 else today.year - 1
 
 
+def _downcast_floats(df):
+    """
+    nflreadpy has no built-in downcast option (unlike the old nfl_data_py),
+    so this recovers that memory savings manually — converting float64
+    columns to float32 after the pandas conversion.
+    """
+    float_cols = df.select_dtypes(include=['float64']).columns
+    df[float_cols] = df[float_cols].astype('float32')
+    return df
+
+
 def send_failure_alert(run_label, error, seasons=None):
     webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
     if not webhook_url:
@@ -115,6 +126,7 @@ class NFLPipeline:
         pbp_pl = nfl.load_pbp(seasons)
         available_pbp_cols = [c for c in PBP_COLUMNS if c in pbp_pl.columns]
         pbp = pbp_pl.select(available_pbp_cols).to_pandas()
+        pbp = _downcast_floats(pbp)
         logger.info(f"  play-by-play: {len(pbp)} rows, {len(pbp.columns)} columns")
 
         try:
@@ -159,6 +171,7 @@ class NFLPipeline:
         for season in seasons:
             try:
                 season_df = nfl.load_player_stats([season], summary_level="week").to_pandas()
+                season_df = _downcast_floats(season_df)
                 frames.append(season_df)
             except Exception as e:
                 logger.warning(f"    weekly stats for {season} failed, skipping: {e}")
@@ -390,3 +403,75 @@ class NFLPipeline:
         schedule_unrolled = self.build_schedule_unrolled(source['schedule'])
 
         elo_history, epa_features, unit_ratings = self.run_feature_engineering(
+            games_df, source['pbp'], schedule_unrolled
+        )
+
+        weekly_stats = self.prepare_weekly_stats(source['weekly_stats'])
+        draft_picks = self.prepare_draft_picks(source['draft_picks'])
+
+        self.ensure_tables()
+
+        logger.info("Writing to Postgres...")
+        self.upsert_by_keys(elo_history, 'nfl_elo_ratings', ['game_id'])
+        self.upsert_by_keys(epa_features, 'nfl_epa_features', ['team', 'season', 'week'])
+        self.upsert_by_keys(unit_ratings, 'nfl_unit_ratings', ['team', 'season', 'week'])
+        self.upsert_by_keys(weekly_stats, 'nfl_player_weekly_stats',
+                             ['player_id', 'season', 'week'])
+        self.upsert_by_keys(draft_picks, 'nfl_draft_picks', ['season', 'pick'])
+
+        if self.s3_client:
+            logger.info("Syncing snapshots to S3...")
+            timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            self.sync_to_s3(elo_history, f'nfl/{run_label}/elo_{timestamp}.parquet')
+            self.sync_to_s3(epa_features, f'nfl/{run_label}/epa_{timestamp}.parquet')
+            self.sync_to_s3(unit_ratings, f'nfl/{run_label}/unit_ratings_{timestamp}.parquet')
+
+        logger.info(f"Pipeline run complete ({run_label}).")
+
+    def run_weekly(self):
+        season = determine_current_season()
+        logger.info(f"=== WEEKLY RUN — season {season} ===")
+        self.run(seasons=[season], run_label='weekly')
+
+    def run_backfill(self, start_year, end_year):
+        seasons = list(range(start_year, end_year + 1))
+        if len(seasons) > 2:
+            logger.info(
+                f"Backfill spans {len(seasons)} seasons ({seasons[0]}-{seasons[-1]}). "
+                "Consider testing a smaller range first."
+            )
+        logger.info(f"=== BACKFILL RUN — seasons {seasons} ===")
+        self.run(seasons=seasons, run_label='backfill')
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cortex Sports Analytics — NFL Pipeline")
+    parser.add_argument('--mode', choices=['weekly', 'backfill'], required=True)
+    parser.add_argument('--start-year', type=int, default=None)
+    parser.add_argument('--end-year', type=int, default=None)
+    args = parser.parse_args()
+
+    current_season = determine_current_season()
+    run_label = args.mode
+    seasons_ctx = None
+
+    try:
+        pipeline = NFLPipeline()
+
+        if args.mode == 'weekly':
+            seasons_ctx = [current_season]
+            pipeline.run_weekly()
+        else:
+            end_year = args.end_year if args.end_year is not None else current_season - 1
+            start_year = args.start_year if args.start_year is not None else current_season - 5
+            seasons_ctx = list(range(start_year, end_year + 1))
+            pipeline.run_backfill(start_year, end_year)
+
+    except Exception as e:
+        logger.exception(f"Pipeline run failed ({run_label}).")
+        send_failure_alert(run_label, e, seasons_ctx)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
