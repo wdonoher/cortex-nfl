@@ -155,12 +155,6 @@ class NFLPipeline:
         }
 
     def _fetch_weekly_stats_per_season(self, seasons):
-        """
-        Kept as a per-season loop defensively, even though nflreadpy
-        (unlike the deprecated nfl_data_py) is expected to handle
-        multi-season requests correctly — cheap insurance given this
-        exact call was the source of the multi-season failure before.
-        """
         frames = []
         for season in seasons:
             try:
@@ -193,50 +187,35 @@ class NFLPipeline:
         return pd.concat([home_rows, away_rows], ignore_index=True)
 
     def prepare_weekly_stats(self, weekly_stats_df):
-    """
-    Column names come from the underlying nflverse data files
-    (same source nfl_data_py used), so 'receiving_air_yards' should
-    still be correct post-migration.
+        if weekly_stats_df.empty:
+            return weekly_stats_df
 
-    Also drops rows with a null player_id — nflreadpy's load_player_stats()
-    includes some team-level/aggregate rows (e.g. defense entries not
-    tied to an individual player) that nfl_data_py either excluded or
-    handled differently. These aren't useful for player-level projections
-    anyway, and our schema requires player_id as part of the primary key.
-    """
-    if weekly_stats_df.empty:
-        return weekly_stats_df
+        wanted = ['player_id', 'player_name', 'position', 'recent_team',
+                  'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
+                  'rushing_tds', 'targets', 'receptions', 'receiving_yards',
+                  'receiving_tds', 'receiving_air_yards', 'passing_yards',
+                  'passing_tds', 'interceptions', 'sacks', 'fantasy_points',
+                  'fantasy_points_ppr']
 
-    wanted = ['player_id', 'player_name', 'position', 'recent_team',
-              'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
-              'rushing_tds', 'targets', 'receptions', 'receiving_yards',
-              'receiving_tds', 'receiving_air_yards', 'passing_yards',
-              'passing_tds', 'interceptions', 'sacks', 'fantasy_points',
-              'fantasy_points_ppr']
+        available = [c for c in wanted if c in weekly_stats_df.columns]
+        missing = set(wanted) - set(available)
+        if missing:
+            logger.warning(f"  weekly stats missing expected columns: {missing}")
 
-    available = [c for c in wanted if c in weekly_stats_df.columns]
-    missing = set(wanted) - set(available)
-    if missing:
-        logger.warning(f"  weekly stats missing expected columns: {missing}")
+        result = weekly_stats_df[available].rename(
+            columns={'receiving_air_yards': 'air_yards'}
+        )
 
-    result = weekly_stats_df[available].rename(
-        columns={'receiving_air_yards': 'air_yards'}
-    )
+        before_count = len(result)
+        result = result.dropna(subset=['player_id'])
+        dropped = before_count - len(result)
+        if dropped > 0:
+            logger.info(f"  weekly stats: dropped {dropped} rows with no player_id "
+                         f"(team-level/aggregate entries, not usable for player projections)")
 
-    before_count = len(result)
-    result = result.dropna(subset=['player_id'])
-    dropped = before_count - len(result)
-    if dropped > 0:
-        logger.info(f"  weekly stats: dropped {dropped} rows with no player_id "
-                     f"(team-level/aggregate entries, not usable for player projections)")
-
-    return result
+        return result
 
     def prepare_draft_picks(self, draft_picks_df):
-        """
-        Same note as weekly stats: column names should carry over from
-        the underlying nflverse files, flagged for verification.
-        """
         if draft_picks_df.empty:
             return draft_picks_df
 
@@ -411,75 +390,3 @@ class NFLPipeline:
         schedule_unrolled = self.build_schedule_unrolled(source['schedule'])
 
         elo_history, epa_features, unit_ratings = self.run_feature_engineering(
-            games_df, source['pbp'], schedule_unrolled
-        )
-
-        weekly_stats = self.prepare_weekly_stats(source['weekly_stats'])
-        draft_picks = self.prepare_draft_picks(source['draft_picks'])
-
-        self.ensure_tables()
-
-        logger.info("Writing to Postgres...")
-        self.upsert_by_keys(elo_history, 'nfl_elo_ratings', ['game_id'])
-        self.upsert_by_keys(epa_features, 'nfl_epa_features', ['team', 'season', 'week'])
-        self.upsert_by_keys(unit_ratings, 'nfl_unit_ratings', ['team', 'season', 'week'])
-        self.upsert_by_keys(weekly_stats, 'nfl_player_weekly_stats',
-                             ['player_id', 'season', 'week'])
-        self.upsert_by_keys(draft_picks, 'nfl_draft_picks', ['season', 'pick'])
-
-        if self.s3_client:
-            logger.info("Syncing snapshots to S3...")
-            timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            self.sync_to_s3(elo_history, f'nfl/{run_label}/elo_{timestamp}.parquet')
-            self.sync_to_s3(epa_features, f'nfl/{run_label}/epa_{timestamp}.parquet')
-            self.sync_to_s3(unit_ratings, f'nfl/{run_label}/unit_ratings_{timestamp}.parquet')
-
-        logger.info(f"Pipeline run complete ({run_label}).")
-
-    def run_weekly(self):
-        season = determine_current_season()
-        logger.info(f"=== WEEKLY RUN — season {season} ===")
-        self.run(seasons=[season], run_label='weekly')
-
-    def run_backfill(self, start_year, end_year):
-        seasons = list(range(start_year, end_year + 1))
-        if len(seasons) > 2:
-            logger.info(
-                f"Backfill spans {len(seasons)} seasons ({seasons[0]}-{seasons[-1]}). "
-                "Consider testing a smaller range first."
-            )
-        logger.info(f"=== BACKFILL RUN — seasons {seasons} ===")
-        self.run(seasons=seasons, run_label='backfill')
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Cortex Sports Analytics — NFL Pipeline")
-    parser.add_argument('--mode', choices=['weekly', 'backfill'], required=True)
-    parser.add_argument('--start-year', type=int, default=None)
-    parser.add_argument('--end-year', type=int, default=None)
-    args = parser.parse_args()
-
-    current_season = determine_current_season()
-    run_label = args.mode
-    seasons_ctx = None
-
-    try:
-        pipeline = NFLPipeline()
-
-        if args.mode == 'weekly':
-            seasons_ctx = [current_season]
-            pipeline.run_weekly()
-        else:
-            end_year = args.end_year if args.end_year is not None else current_season - 1
-            start_year = args.start_year if args.start_year is not None else current_season - 5
-            seasons_ctx = list(range(start_year, end_year + 1))
-            pipeline.run_backfill(start_year, end_year)
-
-    except Exception as e:
-        logger.exception(f"Pipeline run failed ({run_label}).")
-        send_failure_alert(run_label, e, seasons_ctx)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
