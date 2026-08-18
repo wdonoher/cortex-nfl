@@ -3,6 +3,11 @@ Cortex Sports Analytics — NFL Automated Pipeline
 =================================================
 The unattended job that runs on Railway's scheduler. Fetches everything
 via API, computes Elo/EPA/Unit Ratings, writes to Postgres, syncs to S3.
+
+MIGRATED to nflreadpy (from deprecated nfl_data_py) — nflreadpy is the
+actively maintained official successor. Returns Polars DataFrames,
+converted to pandas immediately after each fetch since everything
+downstream (feature engines, projection model) is pandas-based.
 """
 
 import os
@@ -14,7 +19,7 @@ from io import BytesIO
 
 import pandas as pd
 import numpy as np
-import nfl_data_py as nfl
+import nflreadpy as nfl
 from sqlalchemy import create_engine, text
 
 from nfl_feature_engineering import NFLEloEngine, EPAFeatureEngine, UnitRatingEngine
@@ -104,21 +109,23 @@ class NFLPipeline:
     def fetch_source_data(self, seasons):
         logger.info(f"Fetching source data for seasons: {seasons}")
 
-        schedule = nfl.import_schedules(seasons)
+        schedule = nfl.load_schedules(seasons).to_pandas()
         logger.info(f"  schedule: {len(schedule)} rows")
 
-        pbp = nfl.import_pbp_data(seasons, columns=PBP_COLUMNS, downcast=True)
+        pbp_pl = nfl.load_pbp(seasons)
+        available_pbp_cols = [c for c in PBP_COLUMNS if c in pbp_pl.columns]
+        pbp = pbp_pl.select(available_pbp_cols).to_pandas()
         logger.info(f"  play-by-play: {len(pbp)} rows, {len(pbp.columns)} columns")
 
         try:
-            injuries = nfl.import_injuries(seasons)
+            injuries = nfl.load_injuries(seasons).to_pandas()
             logger.info(f"  injuries: {len(injuries)} rows")
         except Exception as e:
             logger.warning(f"  injuries fetch failed, continuing without: {e}")
             injuries = pd.DataFrame()
 
         try:
-            rosters = nfl.import_rosters(seasons)
+            rosters = nfl.load_rosters(seasons).to_pandas()
             logger.info(f"  rosters: {len(rosters)} rows")
         except Exception as e:
             logger.warning(f"  rosters fetch failed, continuing without: {e}")
@@ -132,7 +139,7 @@ class NFLPipeline:
             weekly_stats = pd.DataFrame()
 
         try:
-            draft_picks = nfl.import_draft_picks(seasons)
+            draft_picks = nfl.load_draft_picks(seasons).to_pandas()
             logger.info(f"  draft picks: {len(draft_picks)} rows")
         except Exception as e:
             logger.warning(f"  draft picks fetch failed, continuing without: {e}")
@@ -148,10 +155,16 @@ class NFLPipeline:
         }
 
     def _fetch_weekly_stats_per_season(self, seasons):
+        """
+        Kept as a per-season loop defensively, even though nflreadpy
+        (unlike the deprecated nfl_data_py) is expected to handle
+        multi-season requests correctly — cheap insurance given this
+        exact call was the source of the multi-season failure before.
+        """
         frames = []
         for season in seasons:
             try:
-                season_df = nfl.import_weekly_data([season])
+                season_df = nfl.load_player_stats([season], summary_level="week").to_pandas()
                 frames.append(season_df)
             except Exception as e:
                 logger.warning(f"    weekly stats for {season} failed, skipping: {e}")
@@ -181,9 +194,10 @@ class NFLPipeline:
 
     def prepare_weekly_stats(self, weekly_stats_df):
         """
-        Note: the source column is 'receiving_air_yards', not 'air_yards'
-        (that generic name only exists in raw play-by-play data) — renamed
-        here to match the table schema and downstream feature naming.
+        Column names come from the underlying nflverse data files
+        (same source nfl_data_py used), so 'receiving_air_yards' should
+        still be correct post-migration — but flagged for verification
+        via the missing-columns warning below, same as before.
         """
         if weekly_stats_df.empty:
             return weekly_stats_df
@@ -206,6 +220,10 @@ class NFLPipeline:
         return result
 
     def prepare_draft_picks(self, draft_picks_df):
+        """
+        Same note as weekly stats: column names should carry over from
+        the underlying nflverse files, flagged for verification.
+        """
         if draft_picks_df.empty:
             return draft_picks_df
 
