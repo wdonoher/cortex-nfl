@@ -193,31 +193,44 @@ class NFLPipeline:
         return pd.concat([home_rows, away_rows], ignore_index=True)
 
     def prepare_weekly_stats(self, weekly_stats_df):
-        """
-        Column names come from the underlying nflverse data files
-        (same source nfl_data_py used), so 'receiving_air_yards' should
-        still be correct post-migration — but flagged for verification
-        via the missing-columns warning below, same as before.
-        """
-        if weekly_stats_df.empty:
-            return weekly_stats_df
+    """
+    Column names come from the underlying nflverse data files
+    (same source nfl_data_py used), so 'receiving_air_yards' should
+    still be correct post-migration.
 
-        wanted = ['player_id', 'player_name', 'position', 'recent_team',
-                  'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
-                  'rushing_tds', 'targets', 'receptions', 'receiving_yards',
-                  'receiving_tds', 'receiving_air_yards', 'passing_yards',
-                  'passing_tds', 'interceptions', 'sacks', 'fantasy_points',
-                  'fantasy_points_ppr']
+    Also drops rows with a null player_id — nflreadpy's load_player_stats()
+    includes some team-level/aggregate rows (e.g. defense entries not
+    tied to an individual player) that nfl_data_py either excluded or
+    handled differently. These aren't useful for player-level projections
+    anyway, and our schema requires player_id as part of the primary key.
+    """
+    if weekly_stats_df.empty:
+        return weekly_stats_df
 
-        available = [c for c in wanted if c in weekly_stats_df.columns]
-        missing = set(wanted) - set(available)
-        if missing:
-            logger.warning(f"  weekly stats missing expected columns: {missing}")
+    wanted = ['player_id', 'player_name', 'position', 'recent_team',
+              'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
+              'rushing_tds', 'targets', 'receptions', 'receiving_yards',
+              'receiving_tds', 'receiving_air_yards', 'passing_yards',
+              'passing_tds', 'interceptions', 'sacks', 'fantasy_points',
+              'fantasy_points_ppr']
 
-        result = weekly_stats_df[available].rename(
-            columns={'receiving_air_yards': 'air_yards'}
-        )
-        return result
+    available = [c for c in wanted if c in weekly_stats_df.columns]
+    missing = set(wanted) - set(available)
+    if missing:
+        logger.warning(f"  weekly stats missing expected columns: {missing}")
+
+    result = weekly_stats_df[available].rename(
+        columns={'receiving_air_yards': 'air_yards'}
+    )
+
+    before_count = len(result)
+    result = result.dropna(subset=['player_id'])
+    dropped = before_count - len(result)
+    if dropped > 0:
+        logger.info(f"  weekly stats: dropped {dropped} rows with no player_id "
+                     f"(team-level/aggregate entries, not usable for player projections)")
+
+    return result
 
     def prepare_draft_picks(self, draft_picks_df):
         """
