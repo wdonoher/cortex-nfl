@@ -199,11 +199,12 @@ class NFLPipeline:
             return weekly_stats_df
 
         wanted = ['player_id', 'player_name', 'position', 'team',
-                  'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
-                  'rushing_tds', 'targets', 'receptions', 'receiving_yards',
-                  'receiving_tds', 'receiving_air_yards', 'passing_yards',
-                  'passing_tds', 'passing_interceptions', 'sacks_suffered',
-                  'fantasy_points', 'fantasy_points_ppr']
+          'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
+          'rushing_tds', 'targets', 'receptions', 'receiving_yards',
+          'receiving_tds', 'receiving_air_yards', 'completions', 'attempts',
+          'passing_yards', 'passing_air_yards', 'passing_tds',
+          'passing_interceptions', 'sacks_suffered',
+          'fantasy_points', 'fantasy_points_ppr']
 
         available = [c for c in wanted if c in weekly_stats_df.columns]
         missing = set(wanted) - set(available)
@@ -333,6 +334,10 @@ class NFLPipeline:
             updated_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (player_id, season, week)
         );
+        
+        ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS completions DOUBLE PRECISION;
+        ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS attempts DOUBLE PRECISION;
+        ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS passing_air_yards DOUBLE PRECISION;
 
         CREATE TABLE IF NOT EXISTS nfl_draft_picks (
             season INTEGER,
