@@ -8,6 +8,10 @@ MIGRATED to nflreadpy (from deprecated nfl_data_py) — nflreadpy is the
 actively maintained official successor. Returns Polars DataFrames,
 converted to pandas immediately after each fetch since everything
 downstream (feature engines, projection model) is pandas-based.
+
+NEW (Aug 2026): after the main weekly update, also generates forward-
+looking win-probability predictions for the upcoming week's games,
+using NFLEloEngine.predict_upcoming_games() against current ratings.
 """
 
 import os
@@ -199,12 +203,12 @@ class NFLPipeline:
             return weekly_stats_df
 
         wanted = ['player_id', 'player_name', 'position', 'team',
-          'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
-          'rushing_tds', 'targets', 'receptions', 'receiving_yards',
-          'receiving_tds', 'receiving_air_yards', 'completions', 'attempts',
-          'passing_yards', 'passing_air_yards', 'passing_tds',
-          'passing_interceptions', 'sacks_suffered',
-          'fantasy_points', 'fantasy_points_ppr']
+                  'opponent_team', 'season', 'week', 'carries', 'rushing_yards',
+                  'rushing_tds', 'targets', 'receptions', 'receiving_yards',
+                  'receiving_tds', 'receiving_air_yards', 'completions', 'attempts',
+                  'passing_yards', 'passing_air_yards', 'passing_tds',
+                  'passing_interceptions', 'sacks_suffered',
+                  'fantasy_points', 'fantasy_points_ppr']
 
         available = [c for c in wanted if c in weekly_stats_df.columns]
         missing = set(wanted) - set(available)
@@ -325,7 +329,10 @@ class NFLPipeline:
             receiving_yards DOUBLE PRECISION,
             receiving_tds DOUBLE PRECISION,
             air_yards DOUBLE PRECISION,
+            completions DOUBLE PRECISION,
+            attempts DOUBLE PRECISION,
             passing_yards DOUBLE PRECISION,
+            passing_air_yards DOUBLE PRECISION,
             passing_tds DOUBLE PRECISION,
             interceptions DOUBLE PRECISION,
             sacks DOUBLE PRECISION,
@@ -334,7 +341,7 @@ class NFLPipeline:
             updated_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (player_id, season, week)
         );
-        
+
         ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS completions DOUBLE PRECISION;
         ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS attempts DOUBLE PRECISION;
         ALTER TABLE nfl_player_weekly_stats ADD COLUMN IF NOT EXISTS passing_air_yards DOUBLE PRECISION;
@@ -349,6 +356,19 @@ class NFLPipeline:
             team TEXT,
             updated_at TIMESTAMP DEFAULT NOW(),
             PRIMARY KEY (season, pick)
+        );
+
+        CREATE TABLE IF NOT EXISTS nfl_game_predictions (
+            game_id TEXT PRIMARY KEY,
+            season INTEGER,
+            week INTEGER,
+            home_team TEXT,
+            away_team TEXT,
+            home_rating DOUBLE PRECISION,
+            away_rating DOUBLE PRECISION,
+            home_win_prob DOUBLE PRECISION,
+            away_win_prob DOUBLE PRECISION,
+            generated_at TIMESTAMP DEFAULT NOW()
         );
         """
         with self.engine.begin() as conn:
@@ -431,10 +451,40 @@ class NFLPipeline:
 
         logger.info(f"Pipeline run complete ({run_label}).")
 
+    def generate_upcoming_predictions(self, season):
+        """
+        Runs after the main weekly update — uses whatever team ratings
+        resulted from processing this week's completed games to predict
+        the NEXT upcoming week. Re-derives current ratings from the full
+        completed-games history on a fresh engine instance (simplest
+        correct approach; not the most efficient, worth revisiting later).
+        """
+        schedule = nfl.load_schedules([season]).to_pandas()
+
+        upcoming = schedule[schedule['home_score'].isna()].copy()
+        if upcoming.empty:
+            logger.info("  No upcoming games found — season may be complete.")
+            return
+
+        next_week = upcoming['week'].min()
+        next_week_games = upcoming[upcoming['week'] == next_week]
+
+        elo_engine = NFLEloEngine()
+        completed_games = self.build_games_df(schedule)
+        elo_engine.process_games(completed_games)
+
+        predictions = elo_engine.predict_upcoming_games(next_week_games)
+        logger.info(f"  Generated predictions for {len(predictions)} games (week {next_week})")
+
+        self.upsert_by_keys(predictions, 'nfl_game_predictions', ['game_id'])
+
     def run_weekly(self):
         season = determine_current_season()
         logger.info(f"=== WEEKLY RUN — season {season} ===")
         self.run(seasons=[season], run_label='weekly')
+
+        logger.info("Generating predictions for upcoming games...")
+        self.generate_upcoming_predictions(season)
 
     def run_backfill(self, start_year, end_year):
         seasons = list(range(start_year, end_year + 1))
