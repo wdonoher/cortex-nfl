@@ -386,7 +386,7 @@ class NFLPipeline:
             correct BOOLEAN,
             run_label TEXT,
             generated_at TIMESTAMP DEFAULT NOW(),
-        PRIMARY KEY (game_id, run_label)
+            PRIMARY KEY (game_id, run_label)
         );
         """
         with self.engine.begin() as conn:
@@ -495,6 +495,65 @@ class NFLPipeline:
         logger.info(f"  Generated predictions for {len(predictions)} games (week {next_week})")
 
         self.upsert_by_keys(predictions, 'nfl_game_predictions', ['game_id'])
+
+    def run_backtest(self, test_season, test_week, train_start_season=2021, run_label=None):
+        """
+        Backtests the Elo prediction pipeline against a real, already-played
+        week. Trains ratings on everything strictly before test_week (either
+        prior seasons back to train_start_season, or earlier weeks within
+        test_season), predicts that week using predict_upcoming_games(), then
+        compares against actual results. Writes to nfl_game_predictions_backtest
+        — never touches the production nfl_game_predictions table.
+        """
+        run_label = run_label or f"backtest_{test_season}_wk{test_week}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        seasons_to_load = list(range(train_start_season, test_season + 1))
+
+        logger.info(f"Loading schedule for seasons {seasons_to_load}...")
+        schedule = nfl.load_schedules(seasons_to_load).to_pandas()
+
+        # Training data: everything before the test week
+        train_mask = (
+            (schedule['season'] < test_season) |
+            ((schedule['season'] == test_season) & (schedule['week'] < test_week))
+        )
+        completed_games = self.build_games_df(schedule[train_mask])
+        logger.info(f"  Training Elo on {len(completed_games)} completed games "
+                    f"prior to {test_season} week {test_week}")
+
+        # Target week: the real games we're pretending are "upcoming"
+        target_games = schedule[
+            (schedule['season'] == test_season) & (schedule['week'] == test_week)
+        ].copy()
+
+        if target_games.empty:
+            logger.warning(f"  No games found for {test_season} week {test_week} — check season/week values.")
+            return
+
+        actuals = target_games[['game_id', 'home_team', 'away_team', 'home_score', 'away_score']].copy()
+        actuals['actual_winner'] = actuals.apply(
+            lambda r: r['home_team'] if r['home_score'] > r['away_score'] else r['away_team'], axis=1
+        )
+
+        elo_engine = NFLEloEngine()
+        elo_engine.process_games(completed_games)
+
+        predictions = elo_engine.predict_upcoming_games(target_games)
+        logger.info(f"  Generated {len(predictions)} backtest predictions for "
+                    f"{test_season} week {test_week}")
+
+        predictions = predictions.merge(actuals[['game_id', 'actual_winner']], on='game_id', how='left')
+        predictions['predicted_winner'] = predictions.apply(
+            lambda r: r['home_team'] if r['home_win_prob'] >= 0.5 else r['away_team'], axis=1
+        )
+        predictions['correct'] = predictions['predicted_winner'] == predictions['actual_winner']
+        predictions['run_label'] = run_label
+
+        accuracy = predictions['correct'].mean()
+        logger.info(f"  Backtest accuracy for {test_season} week {test_week}: {accuracy:.1%} "
+                    f"({predictions['correct'].sum()}/{len(predictions)})")
+
+        self.upsert_by_keys(predictions, 'nfl_game_predictions_backtest', ['game_id', 'run_label'])
+        logger.info(f"  Backtest results written under run_label='{run_label}'")
 
     def run_weekly(self):
         season = determine_current_season()
