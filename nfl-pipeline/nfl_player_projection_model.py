@@ -107,7 +107,7 @@ def build_rolling_player_features(weekly_df, position, window=4):
     pos_df = weekly_df[weekly_df['position'] == position].copy()
     pos_df = pos_df.sort_values(['player_id', 'season', 'week'])
     
-        if position == 'QB' and 'completions' in pos_df.columns and 'attempts' in pos_df.columns:
+    if position == 'QB' and 'completions' in pos_df.columns and 'attempts' in pos_df.columns:
             pos_df['completion_pct'] = pos_df['completions'] / pos_df['attempts'].replace(0, np.nan)
 
     stat_cols = [c for c in ROLLING_STAT_COLS[position] if c in pos_df.columns]
