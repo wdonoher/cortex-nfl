@@ -48,14 +48,13 @@ POSITION_MATCHUP_UNITS = {
 ROLLING_STAT_COLS = {
     'QB': ['attempts', 'completions', 'completion_pct', 'passing_yards',
            'passing_air_yards', 'passing_tds', 'interceptions', 'sacks',
-           'rushing_yards', 'rushing_tds', TARGET_COL],
+           'rushing_yards', 'rushing_tds'],
     'RB': ['carries', 'rushing_yards', 'rushing_tds',
-           'targets', 'receptions', 'receiving_yards', TARGET_COL],
+           'targets', 'receptions', 'receiving_yards'],
     'WR': ['targets', 'receptions', 'receiving_yards', 'receiving_tds',
-           'air_yards', TARGET_COL],
-    'TE': ['targets', 'receptions', 'receiving_yards', 'receiving_tds', TARGET_COL],
+           'air_yards'],
+    'TE': ['targets', 'receptions', 'receiving_yards', 'receiving_tds'],
 }
-
 
 # ============================================================================
 # DATABASE CONNECTION / MODEL STORAGE (Postgres)
