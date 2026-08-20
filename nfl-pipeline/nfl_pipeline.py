@@ -370,6 +370,24 @@ class NFLPipeline:
             away_win_prob DOUBLE PRECISION,
             generated_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS nfl_game_predictions_backtest (
+            game_id TEXT,
+            season INTEGER,
+            week INTEGER,
+            home_team TEXT,
+            away_team TEXT,
+            home_rating DOUBLE PRECISION,
+            away_rating DOUBLE PRECISION,
+            home_win_prob DOUBLE PRECISION,
+            away_win_prob DOUBLE PRECISION,
+            predicted_winner TEXT,
+            actual_winner TEXT,
+            correct BOOLEAN,
+            run_label TEXT,
+            generated_at TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (game_id, run_label)
+        );
         """
         with self.engine.begin() as conn:
             for statement in ddl.strip().split(';'):
