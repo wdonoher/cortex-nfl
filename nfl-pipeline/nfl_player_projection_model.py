@@ -215,7 +215,7 @@ class PositionProjectionModel:
         return {'position': self.position, 'mae': mae, 'rmse': rmse, 'r2': r2,
                 'n_test': len(test_df)}
 
-    def feature_importance(self, top_n=10):
+    def feature_importance(self, top_n=20):
         importance = pd.DataFrame({
             'feature': self.feature_cols,
             'importance': self.model.feature_importances_
